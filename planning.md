@@ -16,9 +16,9 @@ search_listings will receive an item, its size and max price from the user's pro
 
 **Input parameters:**
 <!-- List each parameter, its type, and what it represents -->
-- `description` (str): the item user is looking for
-- `size` (str): item's size
-- `max_price` (float): max price of the item
+- `description` (str): the item the user is looking for
+- `size` (str | None): item's size, or None to skip the size filter. Matched by whole token (so "8" matches "US 8" but not "W28" or "8.5").
+- `max_price` (float | None): max price (inclusive), or None to skip the price filter
 
 **What it returns:**
 <!-- Describe the return value — what fields does a result contain? -->
@@ -91,15 +91,16 @@ If fewer than 3 comparables are found, return `verdict: "not enough data"` rathe
 #### Tool 5: get_trends (stretch — live trend awareness)
 
 **What it does:**
-Surfaces fashion styles currently trending for the user's size range, using **live web search** via Groq's agentic `groq/compound` model (it searches the web server-side, so no scraping/API key and no bot-blocking).
+Surfaces fashion styles currently trending for the user's size range, using **live web search** via Groq's agentic `groq/compound-mini` model (it searches the web server-side, so no scraping/API key and no bot-blocking). Note: `groq/compound-mini` is used instead of full `groq/compound`, which exceeds this account's per-request size limit (HTTP 413). The web-search findings are then structured into JSON by the standard model.
 
 **Input parameters:**
 - `size` (str | None): the parsed size, used to scope the trend query.
 - `category` (str | None, optional): narrows trends to a clothing category when known.
+- `listings` (list[dict] | None, optional): pool for the dataset fallback; defaults to `load_listings()`.
 
 **What it returns:**
-A dict: `{ "trends": [ {"style": str, "reason": str}, ... ], "sources": [ {"title": str, "url": str}, ... ] }`.
-Sources come from the model's `executed_tools` search results and are shown as citations so the user can see it is real/live.
+A dict: `{ "trends": [ {"style": str, "reason": str}, ... ], "sources": [ {"title": str, "url": str}, ... ], "source_kind": "live" | "catalog" }`.
+Sources come from the model's `executed_tools` search results and are shown as citations so the user can see it is real/live. `source_kind` records whether the live search succeeded (`"live"`) or the dataset fallback was used (`"catalog"`).
 
 **What happens if it fails or returns nothing:**
 If the live call fails, times out, or returns unparseable output, fall back to **dataset-derived trends** — the most common `style_tags` among listings in the user's size — so the panel always shows something. Never raises.
@@ -118,7 +119,7 @@ The agent follows a fixed linear pipeline, not a dynamic tool-picking loop. Each
 5. (Stretch) Call compare_price(selected_item) → price_assessment.
 6. Call suggest_outfit(selected_item, wardrobe) → outfit_suggestion.
 7. Call create_fit_card(outfit_suggestion, selected_item) → fit_card.
-The agent is "done" when fit_card is set (success) or error is set (early exit). The stretch outputs (trends, price_assessment) feed a combined "Insights" panel in the UI, separate from the original three panels.
+The agent is "done" when fit_card is set (success) or error is set (early exit). The stretch outputs feed two separate cards in the UI below the original three panels: a "Price check" card (price_assessment) and a "Live trends" card (trends).
 ---
 
 ## State Management
@@ -130,13 +131,13 @@ All state lives in one `session` dict created by `_new_session()` in agent.py. I
 | Field | Written by | Read by |
 |---|---|---|
 | `query` | `_new_session` | parse step |
-| `parsed` | parse step | `search_listings` |
+| `parsed` | parse step | `search_listings`, `get_trends` |
+| `trends` | `get_trends` (stretch) | UI Live trends card |
 | `search_results` | `search_listings` | selection step |
-| `selected_item` | selection step | `suggest_outfit`, `create_fit_card` |
+| `selected_item` | selection step | `compare_price`, `suggest_outfit`, `create_fit_card` |
+| `price_assessment` | `compare_price` (stretch) | UI Price check card |
 | `outfit_suggestion` | `suggest_outfit` | `create_fit_card` |
 | `fit_card` | `create_fit_card` | final output |
-| `trends` | `get_trends` (stretch) | UI Insights panel |
-| `price_assessment` | `compare_price` (stretch) | UI Insights panel |
 | `error` | any step on failure | UI (app.py) |
 
 Because all output is collected on this one object, the UI only needs to inspect `session` to render its panels.
@@ -173,16 +174,21 @@ For each tool, describe the specific failure mode you're handling and what the a
                 ┌─────────────────────────────────────┐
   user query ─► │            run_agent()              │
                 │           (planning loop)           │
-                │                                     │
-                │   parse query ──► session["parsed"] │
+                │   parse_query ──► session["parsed"] │
                 └───────────────┬─────────────────────┘
+                                ▼
+                  get_trends(size) ──► session["trends"]   (stretch; runs early,
+                                │                            shown even on no-results)
                                 ▼
                        search_listings()
                                 │
                   empty? ──Yes──► set session["error"] ──► RETURN early
-                                │No
+                                │No                          (trends still returned)
                                 ▼
                      selected_item = search_results[0]
+                                │
+                                ▼
+                  compare_price(item) ──► session["price_assessment"]   (stretch)
                                 │
                                 ▼
                   suggest_outfit(item, wardrobe) ──► outfit_suggestion
@@ -191,7 +197,11 @@ For each tool, describe the specific failure mode you're handling and what the a
                   create_fit_card(outfit, item) ──► fit_card
                                 │
                                 ▼
-                        return session ──► app.py (3 output panels)
+                        return session ──► app.py
+                                            │
+       ┌──────────────┬──────────────┬──────┴──────┬──────────────┐
+       ▼              ▼              ▼             ▼              ▼
+   🛍️ The find   👗 How to wear  ✨ Fit card   💰 Price check  🔥 Live trends
 
    The session dict threads through every step (each step reads + writes it).
    The only branch is the empty-results early exit after search_listings.
@@ -233,14 +243,20 @@ Write out what a full user interaction looks like from start to finish — tool 
 **Step 1:**
 `run_agent()` initializes the session and sends the query to the LLM parser. The LLM returns `{description: "vintage graphic tee", size: None, max_price: 30.0}` (the mention of baggy jeans / chunky sneakers is wardrobe context, not a search filter), stored in `session["parsed"]`. If the LLM had returned bad JSON, it would fall back to using the whole query as the description.
 
-**Step 2:**
-The agent calls `search_listings("vintage graphic tee", None, 30.0)`. It loads all 40 listings, drops anything over $30, scores the rest by keyword overlap with the description, drops zero-score items, and returns the ranked list into `session["search_results"]`. The list is non-empty, so the agent selects `search_results[0]` as `session["selected_item"]` and continues. (If it had been empty, the agent would set `session["error"]` and return here.)
+**Step 2 (stretch):**
+The agent calls `get_trends(size=None)`. `groq/compound-mini` searches the web for currently trending styles, the standard model structures them into JSON, and the result (with source links) is stored in `session["trends"]`. This runs before search, so it appears even if the search later finds nothing. On failure it falls back to dataset-derived trends.
 
 **Step 3:**
+The agent calls `search_listings("vintage graphic tee", None, 30.0)`. It loads all 40 listings, drops anything over $30, scores the rest by keyword overlap with the description, drops zero-score items, and returns the ranked list into `session["search_results"]`. The list is non-empty, so the agent selects `search_results[0]` as `session["selected_item"]` and continues. (If it had been empty, the agent would set `session["error"]` and return here — but the trends from step 2 would still be shown.)
+
+**Step 4 (stretch):**
+The agent calls `compare_price(selected_item)`. It finds same-category listings sharing a style tag, compares the price to their median, and stores a verdict (e.g. "great deal") in `session["price_assessment"]`.
+
+**Step 5:**
 The agent calls `suggest_outfit(selected_item, wardrobe)`. The wardrobe is non-empty, so the LLM is prompted with the tee plus the wardrobe items and returns 1–2 outfit ideas pairing the tee with the baggy jeans and chunky sneakers. The result is stored in `session["outfit_suggestion"]`.
 
-**Step 4:**
+**Step 6:**
 The agent calls `create_fit_card(outfit_suggestion, selected_item)`. The LLM writes a casual 2–4 sentence caption naming the tee, its price, and its platform once each. The result is stored in `session["fit_card"]`, and the agent returns the session.
 
 **Final output to user:**
-The Gradio UI reads the session and fills its three panels: the top listing's details, the outfit idea, and the shareable fit card. If `session["error"]` had been set, the UI would instead show that message in the first panel and leave the other two blank.
+The Gradio UI reads the session and fills its five panels: the top listing's details, the outfit idea, the shareable fit card, the price-check verdict, and the live trends (with source links). If `session["error"]` had been set, the UI would show that message in the first panel and leave the styling panels blank — but the Live trends card still renders.

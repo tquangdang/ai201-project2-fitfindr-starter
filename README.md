@@ -154,8 +154,4 @@ I directed the AI to implement `search_listings` from my `planning.md` Tool 1 sp
 **2. Choosing the trend-tool data source.**
 I directed the AI to build the stretch `get_trends` tool using a *real external* live source. The AI probed candidates and reported back: Depop and Reddit return `403` (bot-blocked), and Groq's `groq/compound` returned `413` (request too large) on this account. Based on that evidence I had it **switch** to `groq/compound-mini` (which performed real web search and returned dated source URLs) and add an automatic **dataset fallback** so the feature degrades gracefully under rate limits instead of breaking. I also overrode the original "no-auth scrape" idea once the 403s proved it wasn't viable.
 
----
 
-## Architecture deep-dive
-
-A full walkthrough (in Vietnamese) of the architecture and end-to-end flow was generated as `ARCHITECTURE.md` / `FitFindr-Architecture.pdf` (kept on the Desktop, outside this repo).
