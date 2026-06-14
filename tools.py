@@ -12,6 +12,7 @@ Tools:
     create_fit_card(outfit, new_item)               → str
 """
 
+import json
 import os
 
 from dotenv import load_dotenv
@@ -23,6 +24,10 @@ load_dotenv()
 
 
 # ── Groq client ───────────────────────────────────────────────────────────────
+
+# Shared chat model for the LLM-backed tools.
+_MODEL = "llama-3.3-70b-versatile"
+
 
 def _get_groq_client():
     """Initialize and return a Groq client using GROQ_API_KEY from .env."""
@@ -69,8 +74,89 @@ def search_listings(
 
     Before writing code, fill in the Tool 1 section of planning.md.
     """
-    # Replace this with your implementation
-    return []
+    listings = load_listings()
+
+    # 1. Filter by price ceiling (inclusive) and size, if provided.
+    if max_price is not None:
+        listings = [item for item in listings if item["price"] <= max_price]
+    if size:
+        size_norm = size.strip().lower()
+        listings = [item for item in listings if _size_matches(size_norm, item["size"])]
+
+    # 2. Score remaining listings by keyword overlap with the description.
+    keywords = _extract_keywords(description)
+    scored = []
+    for item in listings:
+        score = _score_listing(item, keywords)
+        if score > 0:
+            scored.append((score, item))
+
+    # 3. Sort by score, highest first. (Stable sort keeps dataset order on ties.)
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _, item in scored]
+
+
+# Common words that carry no search signal — dropped before scoring.
+_STOP_WORDS = {
+    "a", "an", "the", "and", "or", "for", "with", "in", "of", "to",
+    "my", "me", "i", "looking", "under", "size", "some", "that",
+    "this", "it", "is", "im",
+}
+
+
+def _size_matches(wanted: str, listing_size: str) -> bool:
+    """
+    True if `wanted` (already lowercased) matches the listing's size.
+
+    Splits the listing size into whole tokens on spaces and slashes (keeping
+    decimals like "8.5" intact), so:
+        "m"   matches "S/M"       (tokens: s, m)
+        "8"   matches "US 8"      (tokens: us, 8)
+        "w30" matches "W30 L30"   (tokens: w30, l30)
+        "8"   does NOT match "W28" or "US 8.5"  (no bare "8" token)
+    """
+    tokens = "".join(
+        ch if ch.isalnum() or ch == "." else " " for ch in listing_size.lower()
+    ).split()
+    return wanted in tokens
+
+
+def _extract_keywords(description: str) -> set[str]:
+    """Lowercase the description and return its meaningful word tokens."""
+    tokens = "".join(
+        ch if ch.isalnum() or ch.isspace() else " " for ch in description.lower()
+    ).split()
+    return {tok for tok in tokens if len(tok) > 1 and tok not in _STOP_WORDS}
+
+
+def _score_listing(item: dict, keywords: set[str]) -> int:
+    """
+    Count how many query keywords appear in a listing's searchable fields.
+    Title and style tags are weighted higher since they're the strongest signal.
+    """
+    if not keywords:
+        return 0
+
+    weighted_text = " ".join([
+        item.get("title", ""),
+        " ".join(item.get("style_tags", [])),   # weighted x2 below
+        item.get("category", ""),
+        " ".join(item.get("colors", [])),
+        item.get("description", ""),
+        item.get("brand") or "",
+    ]).lower()
+
+    strong_text = (
+        item.get("title", "") + " " + " ".join(item.get("style_tags", []))
+    ).lower()
+
+    score = 0
+    for kw in keywords:
+        if kw in weighted_text:
+            score += 1
+        if kw in strong_text:   # bonus point for title/style-tag matches
+            score += 1
+    return score
 
 
 # ── Tool 2: suggest_outfit ────────────────────────────────────────────────────
@@ -100,8 +186,63 @@ def suggest_outfit(new_item: dict, wardrobe: dict) -> str:
 
     Before writing code, fill in the Tool 2 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    client = _get_groq_client()
+    item_desc = _format_item(new_item)
+    items = wardrobe.get("items", [])
+
+    if not items:
+        # Empty-wardrobe branch: general styling advice, no specific pieces.
+        prompt = (
+            f"A shopper is considering this secondhand item:\n{item_desc}\n\n"
+            "They haven't entered any wardrobe pieces yet. Give general styling "
+            "advice for this item: what kinds of pieces pair well with it, what "
+            "vibe or occasions it suits, and one or two example outfit directions. "
+            "Keep it to a short, friendly paragraph."
+        )
+    else:
+        # Populated-wardrobe branch: combine the item with named owned pieces.
+        wardrobe_text = "\n".join(f"- {_format_wardrobe_item(w)}" for w in items)
+        prompt = (
+            f"A shopper is considering this secondhand item:\n{item_desc}\n\n"
+            f"Here is what they already own:\n{wardrobe_text}\n\n"
+            "Suggest 1-2 complete outfits that pair the new item with specific "
+            "pieces from their wardrobe. Refer to the owned pieces by name. Keep "
+            "each outfit to 1-2 sentences and explain briefly why it works."
+        )
+
+    response = client.chat.completions.create(
+        model=_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "You are a thoughtful personal stylist who gives "
+                           "concise, wearable outfit advice.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=0.7,
+    )
+    return response.choices[0].message.content.strip()
+
+
+def _format_item(item: dict) -> str:
+    """Compact one-line description of a listing for use in an LLM prompt."""
+    parts = [
+        item.get("title", "item"),
+        f"category: {item.get('category', 'unknown')}",
+        f"colors: {', '.join(item.get('colors', [])) or 'n/a'}",
+        f"style: {', '.join(item.get('style_tags', [])) or 'n/a'}",
+    ]
+    return " | ".join(parts)
+
+
+def _format_wardrobe_item(item: dict) -> str:
+    """Compact one-line description of a wardrobe piece for an LLM prompt."""
+    desc = f"{item.get('name', 'item')} ({item.get('category', 'unknown')}"
+    colors = ", ".join(item.get("colors", []))
+    if colors:
+        desc += f", {colors}"
+    return desc + ")"
 
 
 # ── Tool 3: create_fit_card ───────────────────────────────────────────────────
@@ -133,5 +274,112 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
 
     Before writing code, fill in the Tool 3 section of planning.md.
     """
-    # Replace this with your implementation
-    return ""
+    # 1. Guard against an empty or whitespace-only outfit string.
+    if not outfit or not outfit.strip():
+        return (
+            "Couldn't create a fit card — no outfit suggestion was provided. "
+            "Try generating an outfit first."
+        )
+
+    client = _get_groq_client()
+    title = new_item.get("title", "this piece")
+    price = new_item.get("price")
+    price_str = f"${price:.0f}" if isinstance(price, (int, float)) else "a steal"
+    platform = new_item.get("platform", "secondhand")
+
+    prompt = (
+        f"Write a short, shareable caption for a thrifted outfit post.\n\n"
+        f"Item: {title}\n"
+        f"Price: {price_str}\n"
+        f"Platform: {platform}\n"
+        f"Outfit: {outfit}\n\n"
+        "Guidelines:\n"
+        "- 2-4 sentences, casual and authentic like a real OOTD caption "
+        "(not a product description).\n"
+        f"- Mention the item name, the price ({price_str}), and the platform "
+        f"({platform}) naturally, once each.\n"
+        "- Capture the outfit's vibe in specific terms.\n"
+        "- Just return the caption text, no preamble or quotation marks."
+    )
+
+    response = client.chat.completions.create(
+        model=_MODEL,
+        messages=[
+            {
+                "role": "system",
+                "content": "You write punchy, authentic social-media captions "
+                           "for secondhand fashion finds.",
+            },
+            {"role": "user", "content": prompt},
+        ],
+        temperature=1.0,   # higher temperature → more variety between runs
+    )
+    return response.choices[0].message.content.strip()
+
+
+# ── Query parsing (planning-loop helper) ──────────────────────────────────────
+
+def parse_query(query: str) -> dict:
+    """
+    Use the LLM to extract structured search parameters from a free-text query.
+
+    Args:
+        query: The shopper's natural-language request
+               (e.g., "vintage graphic tee under $30, size M").
+
+    Returns:
+        A dict with keys:
+            description (str):        the item keywords to search for
+            size (str | None):        size to filter by, or None
+            max_price (float | None): price ceiling, or None
+
+    Never raises. If the LLM returns malformed JSON or anything goes wrong,
+    falls back to {description: query, size: None, max_price: None} so the
+    search step can still run.
+    """
+    fallback = {"description": query, "size": None, "max_price": None}
+
+    prompt = (
+        "Extract search parameters from this secondhand-clothing request and "
+        "return ONLY a JSON object with keys \"description\", \"size\", and "
+        "\"max_price\".\n"
+        "- description: the item keywords to search for (string).\n"
+        "- size: the requested size if stated, else null.\n"
+        "- max_price: the price ceiling as a number if stated, else null.\n"
+        "Do not include style/wardrobe context (like what they usually wear) "
+        "in the description.\n\n"
+        f"Request: {query}"
+    )
+
+    try:
+        client = _get_groq_client()
+        response = client.chat.completions.create(
+            model=_MODEL,
+            messages=[
+                {"role": "system", "content": "You extract structured data and reply with JSON only."},
+                {"role": "user", "content": prompt},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        data = json.loads(response.choices[0].message.content)
+    except Exception:
+        return fallback
+
+    description = data.get("description") or query
+    size = data.get("size") or None
+
+    max_price = data.get("max_price")
+    if isinstance(max_price, str):
+        try:
+            max_price = float(max_price.replace("$", "").strip())
+        except ValueError:
+            max_price = None
+    elif not isinstance(max_price, (int, float)):
+        max_price = None
+
+    return {
+        "description": str(description),
+        "size": str(size) if size is not None else None,
+        "max_price": float(max_price) if max_price is not None else None,
+    }
