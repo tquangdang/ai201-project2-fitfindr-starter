@@ -69,7 +69,40 @@ return a descriptive error message string
 
 ### Additional Tools (if any)
 
-<!-- Copy the block above for any tools beyond the required three -->
+#### Tool 4: compare_price (stretch — price fairness)
+
+**What it does:**
+Given a listing, finds comparable items already in the dataset and judges whether the item's price is a great deal, fair, or overpriced. Pure Python, no LLM.
+
+**Input parameters:**
+- `item` (dict): the selected listing being evaluated.
+- `listings` (list[dict], optional): the pool to compare against; defaults to `load_listings()`.
+
+**What it returns:**
+A dict: `{ "verdict": "great deal" | "fair" | "overpriced" | "not enough data", "item_price": float, "median": float, "low": float, "high": float, "comparable_count": int }`.
+- Comparable = same `category` AND sharing ≥1 `style_tag` (size-agnostic); the item itself is excluded.
+- Verdict vs. median of comparables: `≤ −15%` → great deal, within `±15%` → fair, `> +15%` → overpriced.
+
+**What happens if it fails or returns nothing:**
+If fewer than 3 comparables are found, return `verdict: "not enough data"` rather than making a weak claim. Never raises.
+
+---
+
+#### Tool 5: get_trends (stretch — live trend awareness)
+
+**What it does:**
+Surfaces fashion styles currently trending for the user's size range, using **live web search** via Groq's agentic `groq/compound` model (it searches the web server-side, so no scraping/API key and no bot-blocking).
+
+**Input parameters:**
+- `size` (str | None): the parsed size, used to scope the trend query.
+- `category` (str | None, optional): narrows trends to a clothing category when known.
+
+**What it returns:**
+A dict: `{ "trends": [ {"style": str, "reason": str}, ... ], "sources": [ {"title": str, "url": str}, ... ] }`.
+Sources come from the model's `executed_tools` search results and are shown as citations so the user can see it is real/live.
+
+**What happens if it fails or returns nothing:**
+If the live call fails, times out, or returns unparseable output, fall back to **dataset-derived trends** — the most common `style_tags` among listings in the user's size — so the panel always shows something. Never raises.
 
 ---
 
@@ -79,11 +112,13 @@ return a descriptive error message string
 <!-- Describe the logic your planning loop uses. What does it look at? What conditions change its behavior? How does it know when it's done? -->
 The agent follows a fixed linear pipeline, not a dynamic tool-picking loop. Each step's output decides whether the next step runs.
 1. Parse the query into description, size, max_price by asking the LLM to return structured JSON, then store the parsed dict in session["parsed"]. If the LLM returns malformed JSON, fall back to using the raw query as the description with size/max_price set to None.
-2. Call search_listings(). Branch point: if it returns an empty list, set session["error"] and stop — don't call the LLM tools on empty input.
-3. Otherwise select the top result (search_results[0]) as selected_item.
-4. Call suggest_outfit(selected_item, wardrobe) → outfit_suggestion.
-5. Call create_fit_card(outfit_suggestion, selected_item) → fit_card.
-The agent is "done" when fit_card is set (success) or error is set (early exit).
+2. (Stretch) Call get_trends(size) → trends. This depends only on the parsed size, not on search success, so it runs early and is shown even on the no-results path.
+3. Call search_listings(). Branch point: if it returns an empty list, set session["error"] and stop — don't call the styling LLM tools on empty input (trends from step 2 are still returned).
+4. Otherwise select the top result (search_results[0]) as selected_item.
+5. (Stretch) Call compare_price(selected_item) → price_assessment.
+6. Call suggest_outfit(selected_item, wardrobe) → outfit_suggestion.
+7. Call create_fit_card(outfit_suggestion, selected_item) → fit_card.
+The agent is "done" when fit_card is set (success) or error is set (early exit). The stretch outputs (trends, price_assessment) feed a combined "Insights" panel in the UI, separate from the original three panels.
 ---
 
 ## State Management
@@ -100,9 +135,11 @@ All state lives in one `session` dict created by `_new_session()` in agent.py. I
 | `selected_item` | selection step | `suggest_outfit`, `create_fit_card` |
 | `outfit_suggestion` | `suggest_outfit` | `create_fit_card` |
 | `fit_card` | `create_fit_card` | final output |
+| `trends` | `get_trends` (stretch) | UI Insights panel |
+| `price_assessment` | `compare_price` (stretch) | UI Insights panel |
 | `error` | any step on failure | UI (app.py) |
 
-Because all output is collected on this one object, the UI only needs to inspect `session` to render its three panels.
+Because all output is collected on this one object, the UI only needs to inspect `session` to render its panels.
 
 ---
 
@@ -116,6 +153,8 @@ For each tool, describe the specific failure mode you're handling and what the a
 | search_listings | No results match the query | Returns `[]`. The loop sets `session["error"]` to a helpful message (e.g. "No listings matched 'X' — try a broader description or higher price") and returns early, skipping `suggest_outfit` and `create_fit_card`. |
 | suggest_outfit | Wardrobe is empty (`items == []`) | Does not error. Calls the LLM for general styling advice for the item instead of wardrobe-specific combinations, and still returns a non-empty string. |
 | create_fit_card | Outfit input is missing or incomplete | Guards against an empty/whitespace-only `outfit`; returns a descriptive error-message string (never an exception or empty string) so the UI can still display something. |
+| compare_price (stretch) | Fewer than 3 comparable listings | Returns `verdict: "not enough data"` instead of a misleading judgment; never raises. |
+| get_trends (stretch) | Live web-search call fails, times out, or returns unparseable output | Falls back to dataset-derived trends (most common `style_tags` in the user's size); never raises and the panel always shows something. |
 
 ---
 

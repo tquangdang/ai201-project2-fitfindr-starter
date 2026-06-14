@@ -5,7 +5,8 @@
       "Bash(./.venv/Scripts/python.exe agent.py)",
       "Bash(./.venv/Scripts/python.exe -m pip install markdown --quiet)",
       "Bash(./.venv/Scripts/python.exe -c \"import markdown; print\\('markdown OK', markdown.__version__\\)\")",
-      "Bash(./.venv/Scripts/python.exe make_architecture_pdf.py)"
+      "Bash(./.venv/Scripts/python.exe make_architecture_pdf.py)",
+      "Bash(PYTHONIOENCODING=utf-8 ./.venv/Scripts/python.exe -c ' *)"
     ],
     "additionalDirectories": [
       "C:\\Users\\thanh\\Desktop"

@@ -317,6 +317,86 @@ def create_fit_card(outfit: str, new_item: dict) -> str:
     return response.choices[0].message.content.strip()
 
 
+# ── Tool 4: compare_price (stretch) ───────────────────────────────────────────
+
+def compare_price(item: dict, listings: list[dict] | None = None) -> dict:
+    """
+    Estimate whether an item's price is fair, based on comparable listings in
+    the dataset. Pure Python — no LLM.
+
+    Comparable = same category AND sharing at least one style tag (size-agnostic);
+    the item itself is excluded. The verdict compares the item's price to the
+    median of comparables: <= -15% is a great deal, within +/-15% is fair, and
+    > +15% is overpriced.
+
+    Args:
+        item:     The listing being evaluated.
+        listings: Pool to compare against; defaults to load_listings().
+
+    Returns:
+        {
+            "verdict": "great deal" | "fair" | "overpriced" | "not enough data",
+            "item_price": float | None,
+            "median": float | None,
+            "low": float | None,
+            "high": float | None,
+            "comparable_count": int,
+        }
+        With fewer than 3 comparables, verdict is "not enough data". Never raises.
+    """
+    if listings is None:
+        listings = load_listings()
+
+    item_price = item.get("price")
+    category = item.get("category")
+    item_tags = set(item.get("style_tags", []))
+    item_id = item.get("id")
+
+    prices = [
+        other["price"]
+        for other in listings
+        if other.get("id") != item_id
+        and other.get("category") == category
+        and item_tags & set(other.get("style_tags", []))
+        and isinstance(other.get("price"), (int, float))
+    ]
+
+    base = {
+        "verdict": "not enough data",
+        "item_price": float(item_price) if isinstance(item_price, (int, float)) else None,
+        "median": None,
+        "low": None,
+        "high": None,
+        "comparable_count": len(prices),
+    }
+
+    if len(prices) < 3 or not isinstance(item_price, (int, float)):
+        return base
+
+    median = _median(prices)
+    base["median"] = round(median, 2)
+    base["low"] = round(min(prices), 2)
+    base["high"] = round(max(prices), 2)
+
+    if item_price <= median * 0.85:
+        base["verdict"] = "great deal"
+    elif item_price <= median * 1.15:
+        base["verdict"] = "fair"
+    else:
+        base["verdict"] = "overpriced"
+    return base
+
+
+def _median(values: list[float]) -> float:
+    """Return the median of a non-empty list of numbers."""
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return (ordered[mid - 1] + ordered[mid]) / 2
+
+
 # ── Query parsing (planning-loop helper) ──────────────────────────────────────
 
 def parse_query(query: str) -> dict:
@@ -383,3 +463,149 @@ def parse_query(query: str) -> dict:
         "size": str(size) if size is not None else None,
         "max_price": float(max_price) if max_price is not None else None,
     }
+
+
+# ── Tool 5: get_trends (stretch) ──────────────────────────────────────────────
+
+# Agentic Groq model with built-in web search — fetches genuinely live results
+# server-side, so no scraping/API keys and no bot-blocking on our end.
+# compound-mini is used over compound: full compound exceeds this account's
+# per-request size limit (HTTP 413), while mini stays within it.
+_TRENDS_MODEL = "groq/compound-mini"
+
+
+def get_trends(
+    size: str | None = None,
+    category: str | None = None,
+    listings: list[dict] | None = None,
+) -> dict:
+    """
+    Surface fashion styles trending right now for the user's size range, using
+    live web search via Groq's agentic model.
+
+    Two steps: (1) `groq/compound` searches the web and summarizes findings,
+    (2) the standard model structures those notes into clean JSON. Search source
+    links are pulled from the compound model's executed tools so the UI can show
+    citations.
+
+    Args:
+        size:     Parsed size to scope the trend search (e.g. "M").
+        category: Optional clothing category to narrow the search.
+        listings: Pool for the dataset fallback; defaults to load_listings().
+
+    Returns:
+        {
+            "trends": [ {"style": str, "reason": str}, ... ],
+            "sources": [ {"title": str, "url": str}, ... ],
+            "source_kind": "live" | "catalog",
+        }
+
+    Never raises. If the live call fails, times out, or can't be parsed, falls
+    back to dataset-derived trends (most common style tags in the user's size).
+    """
+    scope_bits = []
+    if size:
+        scope_bits.append(f"size {size}")
+    if category:
+        scope_bits.append(category)
+    scope = (" for " + ", ".join(scope_bits)) if scope_bits else ""
+
+    try:
+        client = _get_groq_client()
+
+        # Step 1 — live web search + summary (agentic model).
+        research = client.chat.completions.create(
+            model=_TRENDS_MODEL,
+            messages=[{
+                "role": "user",
+                "content": (
+                    f"Search the web for secondhand / thrift fashion styles that are "
+                    f"trending right now{scope}. Summarize the 5-6 most-mentioned styles "
+                    "with a short reason for each, based on what you find."
+                ),
+            }],
+        )
+        notes_msg = research.choices[0].message
+        sources = _extract_sources(notes_msg)
+
+        # Step 2 — structure the notes into clean JSON (standard model).
+        structured = client.chat.completions.create(
+            model=_MODEL,
+            messages=[
+                {"role": "system", "content": "You convert notes into JSON only."},
+                {"role": "user", "content": (
+                    "From these notes, return ONLY a JSON object of the form "
+                    '{"trends":[{"style":"...","reason":"..."}]} with 4-6 items. '
+                    "Each style is 1-4 words; each reason is 4-8 words.\n\n"
+                    f"Notes:\n{notes_msg.content}"
+                )},
+            ],
+            temperature=0,
+            response_format={"type": "json_object"},
+        )
+        trends = _parse_trends(structured.choices[0].message.content)
+        if trends:
+            return {"trends": trends[:6], "sources": sources[:5], "source_kind": "live"}
+    except Exception:
+        pass
+
+    return _dataset_trends(size, listings)
+
+
+def _parse_trends(text: str) -> list[dict]:
+    """Parse a {"trends":[{style,reason}]} JSON string defensively."""
+    if not text:
+        return []
+    start, end = text.find("{"), text.rfind("}")
+    if start == -1 or end == -1:
+        return []
+    try:
+        data = json.loads(text[start:end + 1])
+    except Exception:
+        return []
+    items = data.get("trends") if isinstance(data, dict) else None
+    out = []
+    for it in items or []:
+        if isinstance(it, dict) and it.get("style"):
+            out.append({"style": str(it["style"]), "reason": str(it.get("reason", "")).strip()})
+    return out
+
+
+def _extract_sources(msg) -> list[dict]:
+    """Pull {title, url} from a compound model's executed search tools."""
+    out, seen = [], set()
+    for tool in getattr(msg, "executed_tools", None) or []:
+        sr = tool.get("search_results") if isinstance(tool, dict) else getattr(tool, "search_results", None)
+        results = (sr.get("results") if isinstance(sr, dict) else getattr(sr, "results", None)) if sr else None
+        for r in results or []:
+            title = r.get("title") if isinstance(r, dict) else getattr(r, "title", None)
+            url = r.get("url") if isinstance(r, dict) else getattr(r, "url", None)
+            if title and url and url not in seen:
+                seen.add(url)
+                out.append({"title": title, "url": url})
+    return out
+
+
+def _dataset_trends(size: str | None, listings: list[dict] | None) -> dict:
+    """Fallback: most common style tags among listings in the user's size."""
+    from collections import Counter
+
+    if listings is None:
+        listings = load_listings()
+
+    pool = listings
+    if size:
+        sized = [x for x in listings if _size_matches(size.strip().lower(), x.get("size", ""))]
+        if sized:
+            pool = sized
+
+    counter = Counter()
+    for item in pool:
+        for tag in item.get("style_tags", []):
+            counter[tag] += 1
+
+    trends = [
+        {"style": style, "reason": f"in {count} listings in your size"}
+        for style, count in counter.most_common(6)
+    ]
+    return {"trends": trends, "sources": [], "source_kind": "catalog"}

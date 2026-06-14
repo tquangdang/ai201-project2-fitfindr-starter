@@ -88,9 +88,80 @@ def _loading_html(message: str) -> str:
 LISTING_EMPTY = _empty_html("🔎", "Describe a piece and your find will appear here.")
 OUTFIT_EMPTY = _empty_html("👗", "Your outfit ideas will appear here.")
 FITCARD_EMPTY = _empty_html("✨", "Your shareable caption will appear here.")
+PRICE_EMPTY = _empty_html("💰", "A price-fairness check will appear here.")
+TRENDS_EMPTY = _empty_html("🔥", "Styles trending in your size will appear here.")
 LISTING_LOADING = _loading_html("Searching secondhand listings…")
 OUTFIT_LOADING = _loading_html("Styling it with your wardrobe…")
 FITCARD_LOADING = _loading_html("Writing your caption…")
+PRICE_LOADING = _loading_html("Checking if the price is fair…")
+TRENDS_LOADING = _loading_html("Searching the web for trends…")
+
+# Map a price verdict to a color-coded badge class (reuses the condition palette).
+_VERDICT_CLASS = {
+    "great deal": "ff-cond-excellent",
+    "fair": "ff-cond-good",
+    "overpriced": "ff-cond-fair",
+}
+
+
+def _price_html(session: dict) -> str:
+    """Render the price-fairness card content from a finished session."""
+    pa = session.get("price_assessment")
+    if not pa or not pa.get("verdict"):
+        return PRICE_EMPTY
+
+    verdict = pa["verdict"]
+    if verdict == "not enough data":
+        return (
+            '<div class="ff-insights">'
+            '<span class="ff-pill">Not enough comparable listings to judge this price.</span>'
+            "</div>"
+        )
+
+    cls = _VERDICT_CLASS.get(verdict, "ff-pill")
+    note = (
+        f'${pa["item_price"]:.0f} vs. a median of ${pa["median"]:.0f} across '
+        f'{pa["comparable_count"]} comparable listings '
+        f'(range ${pa["low"]:.0f}–${pa["high"]:.0f}).'
+    )
+    return (
+        '<div class="ff-insights">'
+        f'<div class="ff-price-verdict"><span class="ff-badge ff-badge-lg {cls}">{_esc(verdict.title())}</span></div>'
+        f'<div class="ff-ins-note">{_esc(note)}</div>'
+        "</div>"
+    )
+
+
+def _trends_html(session: dict) -> str:
+    """Render the trends card content from a finished session."""
+    trends = session.get("trends") or {}
+    items = trends.get("trends") or []
+    if not items:
+        return TRENDS_EMPTY
+
+    live = trends.get("source_kind") == "live"
+    tag = (
+        '<span class="ff-ins-tag ff-tag-live">live web</span>' if live
+        else '<span class="ff-ins-tag ff-tag-cat">from catalog</span>'
+    )
+    rows = "".join(
+        f'<li><b>{_esc(t["style"])}</b>'
+        + (f' — {_esc(t["reason"])}' if t.get("reason") else "")
+        + "</li>"
+        for t in items
+    )
+    srcs = trends.get("sources") or []
+    src_html = ""
+    if srcs:
+        links = " · ".join(
+            f'<a href="{_esc(s["url"])}" target="_blank" rel="noopener">{_esc(s["title"][:40])}</a>'
+            for s in srcs[:3]
+        )
+        src_html = f'<div class="ff-ins-src">Sources: {links}</div>'
+    return (
+        f'<div class="ff-insights"><div class="ff-ins-srctag">{tag}</div>'
+        f'<ul class="ff-ins-list">{rows}</ul>{src_html}</div>'
+    )
 
 
 # ── query handler ─────────────────────────────────────────────────────────────
@@ -101,8 +172,8 @@ def handle_query(user_query: str, wardrobe_choice: str):
     so the UI shows a loading state immediately, then the results once the agent
     finishes.
 
-    Yields a tuple of three values, one per output panel:
-        (listing_html, outfit_markdown, fit_card_markdown)
+    Yields a tuple of five values, one per output panel:
+        (listing_html, outfit_markdown, fit_card_markdown, price_html, trends_html)
     """
     # 1. Guard against an empty query.
     if not user_query or not user_query.strip():
@@ -110,11 +181,13 @@ def handle_query(user_query: str, wardrobe_choice: str):
             _empty_html("✏️", 'Tell me what you\'re after — try "vintage graphic tee under $30, size M".'),
             OUTFIT_EMPTY,
             FITCARD_EMPTY,
+            PRICE_EMPTY,
+            TRENDS_EMPTY,
         )
         return
 
     # 2. Immediate loading state while the agent works.
-    yield LISTING_LOADING, OUTFIT_LOADING, FITCARD_LOADING
+    yield LISTING_LOADING, OUTFIT_LOADING, FITCARD_LOADING, PRICE_LOADING, TRENDS_LOADING
 
     # 3. Select the wardrobe and run the agent.
     if wardrobe_choice == "Empty wardrobe (new user)":
@@ -123,17 +196,20 @@ def handle_query(user_query: str, wardrobe_choice: str):
         wardrobe = get_example_wardrobe()
 
     session = run_agent(user_query.strip(), wardrobe)
+    price, trends = _price_html(session), _trends_html(session)  # trends present even on no-results
 
-    # 4. Error path — show the message in the first panel.
+    # 4. Error path — show the message in the first panel; trends still render.
     if session["error"]:
-        yield _empty_html("🛒", session["error"]), OUTFIT_EMPTY, FITCARD_EMPTY
+        yield _empty_html("🛒", session["error"]), OUTFIT_EMPTY, FITCARD_EMPTY, price, trends
         return
 
-    # 5. Success path — rich listing card + outfit + fit card.
+    # 5. Success path — rich listing card + outfit + fit card + price + trends.
     yield (
         _listing_card_html(session["selected_item"]),
         session["outfit_suggestion"],
         session["fit_card"],
+        price,
+        trends,
     )
 
 
@@ -358,6 +434,23 @@ footer { display: none !important; }
 .ff-examples tbody tr { cursor: pointer; transition: background 0.12s ease; }
 .ff-examples tbody tr:hover td { background: rgba(143,204,234,0.10) !important; color: var(--ff-text) !important; }
 
+/* ── Insights cards (price check + trends) ───────────────── */
+.ff-insights { animation: ff-fade 0.4s ease; }
+.ff-price-verdict { margin: 0.2rem 0 0.6rem; }
+.ff-badge-lg { font-size: 0.95rem !important; padding: 0.32rem 0.8rem !important; }
+.ff-ins-srctag { margin-bottom: 0.7rem; }
+.ff-ins-note { color: var(--ff-muted); font-size: 0.84rem; line-height: 1.5; }
+.ff-ins-list { margin: 0; padding-left: 1.1rem; }
+.ff-ins-list li { font-size: 0.86rem; line-height: 1.55; color: var(--ff-text); margin-bottom: 0.2rem; }
+.ff-ins-list li b { color: var(--ff-accent); }
+.ff-ins-tag { font-size: 0.66rem; font-weight: 600; padding: 0.1rem 0.45rem; border-radius: 999px;
+    margin-left: 0.4rem; text-transform: uppercase; letter-spacing: 0.04em; vertical-align: middle; }
+.ff-tag-live { background: rgba(111,207,151,0.18); color: #7ddca0; border: 1px solid rgba(111,207,151,0.35); }
+.ff-tag-cat { background: rgba(157,181,200,0.14); color: var(--ff-muted); border: 1px solid var(--ff-border); }
+.ff-ins-src { margin-top: 0.6rem; font-size: 0.74rem; color: var(--ff-muted); }
+.ff-ins-src a { color: var(--ff-accent); text-decoration: none; }
+.ff-ins-src a:hover { text-decoration: underline; }
+
 /* footer */
 .ff-foot {
     text-align: center; color: var(--ff-muted); font-size: 0.78rem;
@@ -459,6 +552,14 @@ def build_interface():
                 )
                 copy_btn = gr.Button("📋 Copy caption", elem_id="ff-copy")
 
+        with gr.Row(equal_height=True, elem_classes="ff-results"):
+            with gr.Column(elem_classes="ff-card"):
+                gr.Markdown("### 💰 Price check", elem_classes="ff-card-title")
+                price_output = gr.HTML(PRICE_EMPTY, elem_classes="ff-card-body")
+            with gr.Column(elem_classes="ff-card"):
+                gr.Markdown("### 🔥 Live trends", elem_classes="ff-card-title")
+                trends_output = gr.HTML(TRENDS_EMPTY, elem_classes="ff-card-body")
+
         with gr.Column(elem_classes="ff-examples"):
             gr.Examples(
                 examples=[[q, "Example wardrobe"] for q in EXAMPLE_QUERIES],
@@ -471,7 +572,7 @@ def build_interface():
             "searches → styles → shares</div>"
         )
 
-        outputs = [listing_output, outfit_output, fitcard_output]
+        outputs = [listing_output, outfit_output, fitcard_output, price_output, trends_output]
         submit_btn.click(fn=handle_query, inputs=[query_input, wardrobe_choice], outputs=outputs)
         query_input.submit(fn=handle_query, inputs=[query_input, wardrobe_choice], outputs=outputs)
         copy_btn.click(fn=None, inputs=None, outputs=None, js=COPY_JS)

@@ -18,7 +18,14 @@ Usage (once implemented):
     print(result["error"])   # None on success
 """
 
-from tools import search_listings, suggest_outfit, create_fit_card, parse_query
+from tools import (
+    search_listings,
+    suggest_outfit,
+    create_fit_card,
+    parse_query,
+    compare_price,
+    get_trends,
+)
 
 
 # ── session state ─────────────────────────────────────────────────────────────
@@ -41,6 +48,8 @@ def _new_session(query: str, wardrobe: dict) -> dict:
         "wardrobe": wardrobe,        # user's wardrobe dict
         "outfit_suggestion": None,   # string returned by suggest_outfit
         "fit_card": None,            # string returned by create_fit_card
+        "trends": None,              # dict from get_trends (stretch — Insights panel)
+        "price_assessment": None,    # dict from compare_price (stretch — Insights panel)
         "error": None,               # set if the interaction ended early
     }
 
@@ -99,6 +108,10 @@ def run_agent(query: str, wardrobe: dict) -> dict:
     session["parsed"] = parse_query(query)
     parsed = session["parsed"]
 
+    # Step 2b (stretch): Live trends for the user's size. Depends only on the
+    # parsed size, so it runs before search and is shown even on no-results.
+    session["trends"] = get_trends(size=parsed["size"])
+
     # Step 3: Search the listings. Bail out early if nothing matches —
     # do not call the LLM tools on empty input.
     session["search_results"] = search_listings(
@@ -120,6 +133,9 @@ def run_agent(query: str, wardrobe: dict) -> dict:
 
     # Step 4: Select the top result to style.
     session["selected_item"] = session["search_results"][0]
+
+    # Step 4b (stretch): Judge whether the selected item's price is fair.
+    session["price_assessment"] = compare_price(session["selected_item"])
 
     # Step 5: Suggest an outfit pairing the item with the user's wardrobe.
     session["outfit_suggestion"] = suggest_outfit(
